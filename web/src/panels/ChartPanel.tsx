@@ -67,6 +67,9 @@ const TOOL_STEPS: Record<string, string> = {
   short: 'Short: click where the entry goes',
 };
 
+/** A finger's way with any tool but the brush: the crosshair pinned by a tap, moved by sliding, a tap for each point. */
+const TOUCH_STEPS = 'Tap for the crosshair, slide anywhere to aim it, tap to place each point';
+
 const LAYERS = [
   { id: 'ribbon', label: 'EMA 12/25 ribbon', candles: true },
   { id: 'ema200', label: 'EMA 200', candles: true },
@@ -998,7 +1001,8 @@ export function ChartPanel(props: { panel: ChartPanelState; training?: TrainingC
     }
   }
 
-  const createDrawing = (kind: string, points: DrawingPoint[], label?: string) => saveDrawing({ kind, points, label, style: defaultStyle(kind) });
+  /** `pane`: the study pane it was drawn in, kept in its style; none for the candles. */
+  const createDrawing = (kind: string, points: DrawingPoint[], label?: string, pane?: string) => saveDrawing({ kind, points, label, style: pane ? { ...defaultStyle(kind), pane } : defaultStyle(kind) });
 
   /** `previous`: what the change replaces, when the list already shows it (a dialog's preview). */
   async function changeDrawing(drawingId: number, patch: DrawingChange, record = true, previous?: DrawingChange): Promise<void> {
@@ -1132,9 +1136,9 @@ export function ChartPanel(props: { panel: ChartPanelState; training?: TrainingC
   function onEvent(e: ChartEvent): void {
     switch (e.type) {
       case 'drawingCreated': {
-        const points = e.points;
-        if (e.kind === 'text') setOverlay({ kind: 'note', save: (label) => void createDrawing('text', points, label) });
-        else void createDrawing(e.kind, points);
+        const { points, pane } = e;
+        if (e.kind === 'text') setOverlay({ kind: 'note', save: (label) => void createDrawing('text', points, label, pane) });
+        else void createDrawing(e.kind, points, undefined, pane);
         break;
       }
       case 'selection':
@@ -1719,7 +1723,7 @@ export function ChartPanel(props: { panel: ChartPanelState; training?: TrainingC
           </Show>
           <Show when={tool() !== '' || selected() !== null || drawError() || replayPicking()}>
             <div class="hint" classList={{ 'over-replay': replayOpen() && !(footprintOn() && props.panel.footprintStats === true) }}>
-              {replayPicking() ? `${mobile() ? 'Tap' : 'Click'} the bar to replay from: every bar after it is hidden${mobile() ? '' : ' · esc cancels'}` : tool() ? TOOL_STEPS[tool()] : selected() !== null ? 'Drawing selected · double-click for settings · Delete removes it, esc deselects' : ''}
+              {replayPicking() ? `${mobile() ? 'Tap' : 'Click'} the bar to replay from: every bar after it is hidden${mobile() ? '' : ' · esc cancels'}` : tool() ? (mobile() && tool() !== 'brush' ? TOUCH_STEPS : TOOL_STEPS[tool()]) : selected() !== null ? 'Drawing selected · double-click for settings · Delete removes it, esc deselects' : ''}
               <Show when={drawError()}>{(err) => <span class="warn"> ▲ {err()}</span>}</Show>
             </div>
           </Show>
@@ -1862,7 +1866,17 @@ export function ChartPanel(props: { panel: ChartPanelState; training?: TrainingC
               <Show when={legend()}>
                 {(l) => (
                   <>
-                    <span class="num muted">{l().ohlc}</span>
+                    {/* Each figure apart from its letter, coloured as its bar, as TradingView reads them: run together, O3.2316H… was hard to read. */}
+                    <span class="num ohlc" classList={{ bull: l().up, bear: !l().up }}>
+                      <For each={l().ohlc.split(/\s+/)}>
+                        {(part) => (
+                          <span>
+                            <i>{part[0]}</i>
+                            {part.slice(1)}
+                          </span>
+                        )}
+                      </For>
+                    </span>
                     <span class="num" classList={{ bull: l().up, bear: !l().up }}>
                       {l().change}
                     </span>

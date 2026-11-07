@@ -40,9 +40,10 @@ const RIGHT_MARGIN_BARS: f64 = 2.0;
 /// The tradoor mark's size, in CSS pixels.
 const MARK: f32 = 34.0;
 
-/// Where the mark stands: bottom left of the price pane, where it has room.
-fn mark_at(plot: Rect) -> Option<(f32, f32)> {
-    (plot.w >= 160.0 && plot.h >= 110.0).then(|| (plot.x + 12.0, plot.bottom() - 12.0 - MARK))
+/// Where the mark stands: bottom left of the price pane, where it has room —
+/// above `bottom`, the footprint's stats table where it is shown, whose names it covered.
+fn mark_at(plot: Rect, bottom: f32) -> Option<(f32, f32)> {
+    (plot.w >= 160.0 && bottom - plot.y >= 110.0).then(|| (plot.x + 12.0, bottom - 12.0 - MARK))
 }
 
 /// How many bars past the last one a key level still in force runs, unless its settings say otherwise.
@@ -91,7 +92,8 @@ const HISTORY_MARGIN_BARS: f64 = 80.0;
 #[derive(Clone, Debug, PartialEq)]
 pub enum Event {
     /// The last anchor landed; the page saves it. A `text` drawing still needs its label.
-    DrawingCreated { kind: DrawingKind, points: Vec<Anchor> },
+    /// `pane`: the lower pane it was drawn in, `None` for the price pane.
+    DrawingCreated { kind: DrawingKind, points: Vec<Anchor>, pane: Option<Group> },
     SelectionChanged(Option<i64>),
     DeleteRequested(i64),
     /// Moved or reshaped by hand; the page saves its new anchors.
@@ -420,6 +422,9 @@ enum Drag {
     Held,
     /// Pressed with a tool armed: a drag places its next anchors in one gesture.
     Draw { kind: DrawingKind, start: Anchor, start_px: (f32, f32), moved: bool },
+    /// A finger on a chart whose crosshair is pinned: the crosshair moves by the
+    /// finger's motion, not to the finger, and a tap is the crosshair's.
+    Nudge { start: (f32, f32), last: (f32, f32), moved: bool },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -559,8 +564,12 @@ pub struct Chart {
     ctrl: bool,
     /// The press under way is a finger's, not a mouse's.
     touch_input: bool,
+    /// A tap showed the crosshair on a touch screen: it stays until the next tap.
+    pinned: bool,
     placed: Vec<Anchor>,
     draft: Option<DrawingShape>,
+    /// The pane the drawing being placed is in: its first anchor's.
+    draw_pane: usize,
     events: Vec<Event>,
     history_asked: Option<i64>,
     message: Option<String>,
@@ -633,10 +642,12 @@ impl Chart {
             magnet: Magnet::Off,
             ctrl: false,
             touch_input: false,
+            pinned: false,
             selected: None,
             selected_alert: None,
             tool: None,
             placed: Vec::new(),
+            draw_pane: 0,
             draft: None,
             events: Vec::new(),
             history_asked: None,
@@ -1307,6 +1318,7 @@ impl Chart {
 
     pub fn set_touch(&mut self, touch: bool) {
         self.touch_input = touch;
+        self.pinned &= touch;
     }
 
     /// The magnet in force: the chosen one, or a weak one while Ctrl is held over none.
@@ -1824,7 +1836,7 @@ impl Chart {
     /// sixteen-unit grid. Part of the frame itself, so every capture of a chart
     /// carries it — the name is not written out; the door is what is known.
     fn paint_watermark(&self, f: &mut Frame, plot: Rect) {
-        let Some((x, y)) = mark_at(plot).filter(|_| !self.page_mark) else { return };
+        let Some((x, y)) = mark_at(plot, self.table_top().unwrap_or(plot.bottom())).filter(|_| !self.page_mark) else { return };
         let u = MARK / 16.0;
         let (at, line) = (|dx: f32, dy: f32| (x + dx * u, y + dy * u), (1.5 * u).max(1.0));
         let accent = self.theme.ribbon_fast;
@@ -2095,8 +2107,10 @@ impl Chart {
         let hovered = self.crosshair.filter(|_| self.tool.is_none()).and_then(|(x, y)| self.drawing_at(x, y));
         for mut placed in self.drawings.iter().map(|d| (d, false)).chain(self.draft.iter().map(|d| (d, true))).filter_map(|(d, draft)| self.place(d, draft)) {
             placed.hovered = placed.shape.id.is_some() && placed.shape.id == hovered;
-            drawings::paint(f, &placed, price.plot, t);
+            f.clip(Some(placed.plot));
+            drawings::paint(f, &placed, placed.plot, t);
         }
+        f.clip(Some(price.plot));
 
         // Price alerts: a level in its own style (dashed unless set otherwise),
         // solid while the pointer holds it, with a ring by the axis as
@@ -2125,6 +2139,11 @@ impl Chart {
 
         // ---- crosshair
         let hover = self.crosshair.filter(|(x, y)| *x >= 0.0 && *x < plot_w && *y >= 0.0 && *y < avail && !matches!(self.drag, Drag::Separator { .. } | Drag::Table { .. }));
+        // With the magnet on, the crosshair stands where an anchor would land, as
+        // TradingView's does: on the bar's open, high, low or close — always when
+        // strong, when near one when weak (or Ctrl held), else on a whole tick.
+        let snapped = hover.and_then(|(x, y)| self.point_in(0, x, y).filter(|_| self.magnet_now() != Magnet::Off && self.pane_at(y) == Some(0))).map(|a| a.price);
+        let hover = hover.map(|(x, y)| (x, snapped.map_or(y, |p| price.scale.y(p) as f32)));
         // Another chart's crosshair, in a layout keeping them in step, stands where this one's is not.
         let hover_slot = match hover {
             Some((x, _)) => self.slot_at(x),
@@ -2243,7 +2262,8 @@ impl Chart {
         if let Some((pi, cy)) = crosshair_price {
             let pane = self.panes[pi];
             f.crisp_rect(plot_w + 1.0, cy - badge_h / 2.0, self.axis_width - 1.0, badge_h, t.label_background);
-            f.text(plot_w + 6.0, cy, self.format_value(pane.group, pane.scale.price(f64::from(cy))), t.countdown_text, Align::Left, Baseline::Middle, font, None, None);
+            let value = snapped.filter(|_| pi == 0).unwrap_or_else(|| pane.scale.price(f64::from(cy)));
+            f.text(plot_w + 6.0, cy, self.format_value(pane.group, value), t.countdown_text, Align::Left, Baseline::Middle, font, None, None);
         }
 
         // ---- time labels
@@ -2535,8 +2555,32 @@ impl Chart {
         Some(if longer && held { logical.floor() } else { logical })
     }
 
+    /// The pane a drawing stands in, when it is on the chart: its study's, gone with it.
+    fn pane_of(&self, shape: &DrawingShape) -> Option<usize> {
+        match shape.style.pane {
+            None => Some(0),
+            Some(group) => self.panes.iter().position(|p| p.group == group),
+        }
+    }
+
+    /// The group a drawing placed in pane `index` is kept by: none for the price pane.
+    fn group_of(&self, index: usize) -> Option<Group> {
+        self.panes.get(index).map(|p| p.group).filter(|_| index > 0)
+    }
+
+    fn created(&mut self, kind: DrawingKind, points: Vec<Anchor>) {
+        let pane = self.group_of(self.draw_pane);
+        self.events.push(Event::DrawingCreated { kind, points, pane });
+    }
+
+    /// The drawing being placed, in its pane, as the tool's style has it.
+    fn draft_of(&self, kind: DrawingKind, points: Vec<Anchor>) -> DrawingShape {
+        DrawingShape { style: DrawingStyle { pane: self.group_of(self.draw_pane), ..self.tool_style.clone() }, ..DrawingShape::new(None, kind, points) }
+    }
+
     fn place<'a>(&self, shape: &'a DrawingShape, draft: bool) -> Option<Placed<'a>> {
-        let pane = self.panes.first()?;
+        let index = self.pane_of(shape)?;
+        let pane = self.panes.get(index)?;
         let mut points = Vec::with_capacity(shape.points.len());
         for a in &shape.points {
             let x = self.time.x(self.drawing_logical(shape, a.time)?) as f32;
@@ -2551,7 +2595,9 @@ impl Chart {
             _ => 0,
         };
         let last = self.candles.last().map(|c| c.close);
-        Some(Placed { shape, points, selected: !draft && shape.id.is_some() && shape.id == self.selected, draft, hovered: false, bars, scale: pane.scale, precision: self.precision(), last })
+        // A lower pane's values read to two places, as its axis has them.
+        let precision = if index == 0 { self.precision() } else { 2 };
+        Some(Placed { shape, points, selected: !draft && shape.id.is_some() && shape.id == self.selected, draft, hovered: false, bars, scale: pane.scale, precision, last, plot: pane.plot })
     }
 
     // ------------------------------------------------------------------ legend
@@ -2605,7 +2651,7 @@ impl Chart {
                 .tpo_hovered()
                 .filter(|_| self.tool.is_none())
                 .and_then(|(k, bar)| tpo::hover(self.tpo_profiles.as_ref()?, &self.tpo_settings, k, self.bar(bar).map(|b| (bar, b.time)))),
-            mark: mark_at(pane.plot).filter(|_| self.page_mark).map(|(x, y)| (x, y, self.theme.ribbon_fast, self.theme.bear)),
+            mark: mark_at(pane.plot, self.table_top().unwrap_or(pane.plot.bottom())).filter(|_| self.page_mark).map(|(x, y)| (x, y, self.theme.ribbon_fast, self.theme.bear)),
         }
     }
 
@@ -2674,7 +2720,11 @@ impl Chart {
     }
 
     fn anchor_at(&self, x: f32, y: f32) -> Option<Anchor> {
-        let pane = self.panes.first()?;
+        self.anchor_in(self.draw_pane, x, y)
+    }
+
+    fn anchor_in(&self, pane: usize, x: f32, y: f32) -> Option<Anchor> {
+        let pane = self.panes.get(pane)?;
         let time = logical_to_time(&self.times, self.time.logical(f64::from(x)))?;
         let price = pane.scale.price(f64::from(y));
         (time.is_finite() && price.is_finite()).then_some(Anchor { time, price })
@@ -2682,9 +2732,14 @@ impl Chart {
 
     /// An anchor where the pointer is, pulled by the magnet when it is on.
     fn point_at(&self, x: f32, y: f32) -> Option<Anchor> {
-        let raw = self.anchor_at(x, y)?;
+        self.point_in(self.draw_pane, x, y)
+    }
+
+    fn point_in(&self, pane: usize, x: f32, y: f32) -> Option<Anchor> {
+        let raw = self.anchor_in(pane, x, y)?;
         let magnet = self.magnet_now();
-        if magnet == Magnet::Off {
+        // A lower pane has no candles to hold on to.
+        if magnet == Magnet::Off || pane > 0 {
             return Some(raw);
         }
         let pane = self.panes.first()?;
@@ -2724,6 +2779,7 @@ impl Chart {
     }
 
     fn move_anchor(&mut self, id: i64, index: usize, x: f32, y: f32) {
+        self.draw_pane = self.drawings.iter().find(|d| d.id == Some(id)).and_then(|d| self.pane_of(d)).unwrap_or(0);
         let Some(mut anchor) = self.point_at(x, y) else { return };
         let shift = self.shift;
         if let Some(shape) = self.drawings.iter_mut().find(|d| d.id == Some(id)) {
@@ -2776,8 +2832,8 @@ impl Chart {
     /// Shift a whole drawing by a pointer move: along the bars, and by the same
     /// distance on the price axis — a ratio under a log scale.
     fn move_shape(&mut self, id: i64, from: (f32, f32), to: (f32, f32)) {
-        let Some(pane) = self.panes.first().copied() else { return };
         let Some(index) = self.drawings.iter().position(|d| d.id == Some(id)) else { return };
+        let Some(pane) = self.pane_of(&self.drawings[index]).and_then(|p| self.panes.get(p)).copied() else { return };
         let bars = f64::from(to.0 - from.0) / self.time.bar_spacing;
         let scale = pane.scale;
         let rise = scale.transform(scale.price(f64::from(to.1))) - scale.transform(scale.price(f64::from(from.1)));
@@ -2795,13 +2851,13 @@ impl Chart {
 
     fn drawing_at(&self, x: f32, y: f32) -> Option<i64> {
         let (mut best, mut best_distance) = (None, HIT_TOLERANCE);
-        let plot = self.panes.first()?.plot;
         for d in &self.drawings {
             let Some(placed) = self.place(d, false) else { continue };
-            if placed.shape.style.locked {
+            // Only where it is drawn: a line in a lower pane is not caught over the candles.
+            if placed.shape.style.locked || !placed.plot.contains(x, y) {
                 continue;
             }
-            let distance = drawings::distance(&placed, (x, y), plot);
+            let distance = drawings::distance(&placed, (x, y), placed.plot);
             // `<=`: later drawings are painted on top, so the visible one wins a tie.
             if distance <= best_distance {
                 best_distance = distance;
@@ -2829,7 +2885,7 @@ impl Chart {
                 Zone::PriceAxis(0) if self.alert_badge_at(x, y).is_some_and(|id| self.selected_alert != Some(id)) && !self.touch_input => Cursor::Pointer,
                 Zone::PriceAxis(_) => Cursor::NsResize,
                 Zone::TimeAxis => Cursor::ColResize,
-                Zone::Plot(0) if self.handle_at(x, y).is_some() => Cursor::Pointer,
+                Zone::Plot(_) if self.handle_at(x, y).is_some() => Cursor::Pointer,
                 Zone::Plot(0) if let Some((id, _)) = self.alert_at(x, y) => {
                     if self.selected_alert == Some(id) {
                         Cursor::NsResize
@@ -2837,12 +2893,11 @@ impl Chart {
                         Cursor::Pointer
                     }
                 }
-                Zone::Plot(0) => match self.drawing_at(x, y) {
+                Zone::Plot(_) => match self.drawing_at(x, y) {
                     Some(id) if self.selected == Some(id) => Cursor::Move,
                     Some(_) => Cursor::Pointer,
                     None => Cursor::Crosshair,
                 },
-                Zone::Plot(_) => Cursor::Crosshair,
                 Zone::Outside => Cursor::Default,
             },
         }
@@ -2851,10 +2906,22 @@ impl Chart {
     fn draft_with(&mut self, kind: DrawingKind, extra: Option<Anchor>) {
         let mut points = self.placed.clone();
         points.extend(extra.map(|a| self.constrain(kind, &self.placed, a)));
-        self.draft = Some(DrawingShape { style: self.tool_style.clone(), ..DrawingShape::new(None, kind, points) });
+        self.draft = Some(self.draft_of(kind, points));
     }
 
     pub fn pointer_move(&mut self, x: f32, y: f32) {
+        // A pinned crosshair goes by the finger's motion, once it is more than a tap's.
+        if let Drag::Nudge { start, last, moved } = self.drag {
+            if !moved && (x - start.0).hypot(y - start.1) <= CLICK_SLOP {
+                return;
+            }
+            let (cx, cy) = self.crosshair.unwrap_or(start);
+            let to = ((cx + x - last.0).max(0.0).min(self.plot_width() - 1.0), (cy + y - last.1).max(0.0).min(self.time_axis_top() - 1.0));
+            self.drag = Drag::None;
+            self.pointer_move(to.0, to.1);
+            self.drag = Drag::Nudge { start, last: (x, y), moved: true };
+            return;
+        }
         self.crosshair = Some((x, y));
         match self.drag {
             Drag::Press { start, last_x, last_y, pane, panning, price_pan } => {
@@ -2893,7 +2960,7 @@ impl Chart {
                     self.touch();
                 }
             }
-            Drag::Held => {}
+            Drag::Held | Drag::Nudge { .. } => {}
             Drag::Alert { id, .. } => {
                 if let Some(pane) = self.panes.first() {
                     let step = 10f64.powi(-(self.precision() as i32));
@@ -2920,7 +2987,7 @@ impl Chart {
                         points.push(start);
                         let end = self.constrain(kind, &points, end);
                         points.push(end);
-                        self.draft = Some(DrawingShape { style: self.tool_style.clone(), ..DrawingShape::new(None, kind, points) });
+                        self.draft = Some(self.draft_of(kind, points));
                     }
                 }
                 self.drag = Drag::Draw { kind, start, start_px, moved };
@@ -2950,6 +3017,10 @@ impl Chart {
             return;
         }
         self.span = None;
+        if self.pinned && self.tool != Some(DrawingKind::Brush) && matches!(self.zone(x, y), Zone::Plot(_)) {
+            self.drag = Drag::Nudge { start: (x, y), last: (x, y), moved: false };
+            return;
+        }
         let free = self.tool.is_none();
         // A finger passing over an alert on its way to scale or pan is not
         // taking hold of it: on a touch screen the alert waits for a hold.
@@ -2969,14 +3040,18 @@ impl Chart {
             },
             Zone::PriceAxis(p) if free => Drag::PriceAxis { pane: p, last_y: y },
             Zone::TimeAxis if free => Drag::TimeAxis { last_x: x },
-            Zone::Plot(0) if self.tool == Some(DrawingKind::Brush) => match self.anchor_at(x, y) {
-                Some(a) => {
-                    self.placed = vec![a];
-                    self.draft_with(DrawingKind::Brush, None);
-                    Drag::Brush { last: (x, y) }
+            // Drawn in whichever pane it starts in: the candles', or a study's on its values.
+            Zone::Plot(p) if self.tool == Some(DrawingKind::Brush) => {
+                self.draw_pane = p;
+                match self.anchor_at(x, y) {
+                    Some(a) => {
+                        self.placed = vec![a];
+                        self.draft_with(DrawingKind::Brush, None);
+                        Drag::Brush { last: (x, y) }
+                    }
+                    None => Drag::None,
                 }
-                None => Drag::None,
-            },
+            }
             // A handle of the selected drawing reshapes it and anywhere else on
             // it moves it. Any other drawing is only picked by a click: a drag
             // that starts on it pans, as on bare chart, since a position's box
@@ -2984,22 +3059,27 @@ impl Chart {
             // could hardly be moved past them without moving them. An alert's
             // line likewise: picked by a click, and only then dragged — a line
             // across the chart is easily caught by a press meant for the chart.
-            Zone::Plot(0) if free => {
+            Zone::Plot(p) if free => {
                 if let Some((id, index)) = self.handle_at(x, y) {
                     Drag::Anchor { id, index, moved: false }
-                } else if let Some((id, _)) = self.alert_at(x, y).filter(|(id, _)| grab_alerts && self.selected_alert == Some(*id)) {
+                } else if let Some((id, _)) = self.alert_at(x, y).filter(|(id, _)| p == 0 && grab_alerts && self.selected_alert == Some(*id)) {
                     Drag::Alert { id, moved: false }
                 } else if let Some(id) = self.drawing_at(x, y).filter(|id| self.selected == Some(*id)) {
                     Drag::Shape { id, last: (x, y), moved: false }
                 } else {
-                    Drag::Press { start: (x, y), last_x: x, last_y: y, pane: 0, panning: false, price_pan: false }
+                    Drag::Press { start: (x, y), last_x: x, last_y: y, pane: p, panning: false, price_pan: false }
                 }
             }
-            // With a tool armed, a drag places its anchors in one gesture.
-            Zone::Plot(0) if !matches!(self.tool, Some(DrawingKind::Text | DrawingKind::Path | DrawingKind::Long | DrawingKind::Short)) => match (self.tool, self.point_at(x, y)) {
-                (Some(kind), Some(start)) => Drag::Draw { kind, start, start_px: (x, y), moved: false },
-                _ => Drag::None,
-            },
+            // With a tool armed, a drag places its anchors in one gesture, in the pane it starts in.
+            Zone::Plot(p) if !matches!(self.tool, Some(DrawingKind::Text | DrawingKind::Path | DrawingKind::Long | DrawingKind::Short)) => {
+                if self.placed.is_empty() {
+                    self.draw_pane = p;
+                }
+                match (self.tool, self.point_at(x, y)) {
+                    (Some(kind), Some(start)) => Drag::Draw { kind, start, start_px: (x, y), moved: false },
+                    _ => Drag::None,
+                }
+            }
             Zone::Plot(p) => Drag::Press { start: (x, y), last_x: x, last_y: y, pane: p, panning: false, price_pan: false },
             _ => Drag::None,
         };
@@ -3035,14 +3115,26 @@ impl Chart {
 
     pub fn pointer_up(&mut self, x: f32, y: f32) {
         match std::mem::replace(&mut self.drag, Drag::None) {
-            Drag::Press { start, panning: false, .. } if (x - start.0).hypot(y - start.1) <= CLICK_SLOP => self.click(x, y),
+            Drag::Press { start, panning: false, .. } if (x - start.0).hypot(y - start.1) <= CLICK_SLOP => {
+                if !self.pin(x, y) {
+                    self.click(x, y);
+                }
+            }
             Drag::Held if self.tool.is_some() => self.click(x, y),
+            // A tap with the crosshair up: a tool's next anchor where it stands, or the crosshair put away.
+            Drag::Nudge { moved: false, .. } => match (self.tool, self.crosshair) {
+                (Some(_), Some((cx, cy))) => self.click(cx, cy),
+                _ => {
+                    self.pinned = false;
+                    self.crosshair = None;
+                }
+            },
             Drag::Brush { .. } => {
                 let points = std::mem::take(&mut self.placed);
                 self.draft = None;
                 // A press with no movement is a dot, not a stroke.
                 if points.len() >= DrawingKind::Brush.arity() {
-                    self.events.push(Event::DrawingCreated { kind: DrawingKind::Brush, points });
+                    self.created(DrawingKind::Brush, points);
                     self.finish_tool();
                 }
             }
@@ -3058,7 +3150,9 @@ impl Chart {
             }
             Drag::Draw { kind, start, start_px, moved } => {
                 if !moved || (x - start_px.0).hypot(y - start_px.1) <= CLICK_SLOP {
-                    self.click(x, y);
+                    if !self.pin(x, y) {
+                        self.click(x, y);
+                    }
                 } else if let Some(end) = self.point_at(x, y) {
                     let mut points = std::mem::take(&mut self.placed);
                     if kind.arity() == 1 {
@@ -3069,7 +3163,7 @@ impl Chart {
                         points.push(end);
                     }
                     if points.len() >= kind.arity() {
-                        self.events.push(Event::DrawingCreated { kind, points });
+                        self.created(kind, points);
                         self.finish_tool();
                     } else {
                         self.placed = points;
@@ -3086,7 +3180,10 @@ impl Chart {
     }
 
     pub fn pointer_leave(&mut self) {
-        self.crosshair = None;
+        // A finger lifting leaves too: a pinned crosshair stays for it.
+        if !self.pinned {
+            self.crosshair = None;
+        }
         if !matches!(self.drag, Drag::Brush { .. }) {
             self.drag = Drag::None;
         }
@@ -3135,6 +3232,24 @@ impl Chart {
         self.touch();
     }
 
+    /// A finger's tap where nothing takes it: the crosshair shown there and kept,
+    /// as on TradingView's app. A finger then moves it by its motion, so it never
+    /// covers the point, a tap with a tool places the next anchor where the
+    /// crosshair stands, and a tap without one puts it away. A tap on a drawing
+    /// or an alert picks it instead; the brush draws under the finger.
+    fn pin(&mut self, x: f32, y: f32) -> bool {
+        let takes = match self.tool {
+            Some(tool) => tool != DrawingKind::Brush,
+            None => self.drawing_at(x, y).is_none() && self.alert_at(x, y).is_none(),
+        };
+        if !self.touch_input || self.pinned || !takes || !matches!(self.zone(x, y), Zone::Plot(_)) {
+            return false;
+        }
+        self.pinned = true;
+        self.crosshair = Some((x, y));
+        true
+    }
+
     fn finish_tool(&mut self) {
         self.tool = None;
         self.placed.clear();
@@ -3143,18 +3258,27 @@ impl Chart {
     }
 
     fn click(&mut self, x: f32, y: f32) {
-        let on_price = self.zone(x, y) == Zone::Plot(0);
+        let zone = self.zone(x, y);
+        let on_price = zone == Zone::Plot(0);
         match self.tool {
             None => match self.alert_at(x, y).filter(|_| on_price) {
                 Some((id, _)) => self.pick_alert(Some(id)),
                 None => {
                     self.pick_alert(None);
-                    self.select(if on_price { self.drawing_at(x, y) } else { None });
+                    self.select(if matches!(zone, Zone::Plot(_)) { self.drawing_at(x, y) } else { None });
                 }
             },
             Some(DrawingKind::Brush) => {}
             Some(tool) => {
-                let Some(anchor) = self.point_at(x, y).filter(|_| on_price) else { return };
+                let Zone::Plot(p) = zone else { return };
+                // A position is priced: on the candles only.
+                if tool.is_position() && p > 0 {
+                    return;
+                }
+                if self.placed.is_empty() {
+                    self.draw_pane = p;
+                }
+                let Some(anchor) = self.point_at(x, y) else { return };
                 if tool.is_position() {
                     self.place_position(tool, x, y);
                     return;
@@ -3168,7 +3292,7 @@ impl Chart {
                     return;
                 }
                 let points = std::mem::take(&mut self.placed);
-                self.events.push(Event::DrawingCreated { kind: tool, points });
+                self.created(tool, points);
                 self.finish_tool();
             }
         }
@@ -3187,7 +3311,7 @@ impl Chart {
         let tick = |p: f64| (p * scale).round() / scale;
         let points = vec![Anchor { price: tick(entry.price), ..entry }, Anchor { time: edge.time, price: tick(stop.price) }, Anchor { time: edge.time, price: tick(target.price) }];
         self.placed.clear();
-        self.events.push(Event::DrawingCreated { kind: tool, points });
+        self.created(tool, points);
         self.finish_tool();
     }
 
@@ -3199,7 +3323,7 @@ impl Chart {
             self.placed = points;
             return false;
         }
-        self.events.push(Event::DrawingCreated { kind: DrawingKind::Path, points });
+        self.created(DrawingKind::Path, points);
         self.finish_tool();
         true
     }
@@ -4232,7 +4356,7 @@ mod tests {
         c.pointer_move(500.0, 150.0);
         click(&mut c, 500.0, 150.0);
         let events = c.take_events();
-        let Event::DrawingCreated { kind, points } = &events[0] else { panic!("{events:?}") };
+        let Event::DrawingCreated { kind, points, .. } = &events[0] else { panic!("{events:?}") };
         assert_eq!((*kind, points.len()), (DrawingKind::Trendline, 2));
         assert!((c.panes[0].scale.y(points[1].price) - 150.0).abs() < 1e-6);
         assert_eq!(events[1], Event::ToolFinished);
@@ -4465,7 +4589,7 @@ mod tests {
         c.pointer_move(420.0, 260.0);
         c.pointer_up(420.0, 260.0);
         let events = c.take_events();
-        let Some(Event::DrawingCreated { kind, points }) = events.first().cloned() else { panic!("{events:?}") };
+        let Some(Event::DrawingCreated { kind, points, .. }) = events.first().cloned() else { panic!("{events:?}") };
         assert_eq!((kind, points.len()), (DrawingKind::Rect, 2));
         assert_eq!(c.tool(), None, "and the tool is done");
     }
@@ -4507,6 +4631,21 @@ mod tests {
         assert_eq!(c.point_at(x, y_close + 3.0).unwrap().price, bar.close);
         c.set_ctrl(false);
         assert_ne!(c.point_at(x, y_close + 3.0).unwrap().price, bar.close);
+
+        // The crosshair stands where the anchor would: its price tag reads the high, not the pointer's price.
+        let tag = |c: &mut Chart, y: f32| {
+            c.pointer_move(x, y);
+            let frame = c.render(0).clone();
+            frame.texts.iter().any(|t| t.text == c.format_value(Group::Price, bar.high))
+        };
+        let near_high = c.panes[0].scale.y(bar.high) as f32 + 3.0;
+        c.set_magnet(Magnet::Strong);
+        assert!(tag(&mut c, far_y), "strong: on the high from far off");
+        c.set_magnet(Magnet::Weak);
+        assert!(!tag(&mut c, far_y), "weak: free far from the bar");
+        assert!(tag(&mut c, near_high), "weak: on the high three pixels off");
+        c.set_magnet(Magnet::Off);
+        assert!(!tag(&mut c, near_high), "off: where the pointer is");
     }
 
     #[test]
@@ -4531,7 +4670,7 @@ mod tests {
         c.pointer_down(300.0, 200.0, 0);
         c.pointer_up(300.0, 200.0);
         let events = c.take_events();
-        let Some(Event::DrawingCreated { kind, points }) = events.first().cloned() else { panic!("{events:?}") };
+        let Some(Event::DrawingCreated { kind, points, .. }) = events.first().cloned() else { panic!("{events:?}") };
         assert_eq!(kind, DrawingKind::Long);
         let (entry, stop, target) = (points[0], points[1], points[2]);
         assert!(stop.price < entry.price && target.price > entry.price, "a long's stop is below and its target above");
@@ -4725,6 +4864,110 @@ mod tests {
     }
 
     #[test]
+    fn drawings_go_in_a_study_pane_on_its_values() {
+        let mut c = chart();
+        c.set_studies("rsi:14");
+        c.render(1_800_000_000_000);
+        let (price, rsi) = (c.panes[0], c.panes[1]);
+        assert_eq!(rsi.group, Group::Pct);
+        let (top, bottom) = (rsi.plot.y + rsi.plot.h * 0.2, rsi.plot.y + rsi.plot.h * 0.8);
+
+        // A line dragged across the RSI pane is the RSI pane's, on its own values.
+        c.set_tool(Some(DrawingKind::Trendline));
+        c.pointer_down(300.0, bottom, 0);
+        c.pointer_move(360.0, (top + bottom) / 2.0);
+        c.pointer_move(420.0, top);
+        c.pointer_up(420.0, top);
+        let Some(Event::DrawingCreated { kind: DrawingKind::Trendline, points, pane }) = c.take_events().into_iter().find(|e| matches!(e, Event::DrawingCreated { .. })) else { panic!("drawn") };
+        assert_eq!(pane, Some(Group::Pct));
+        let value = |y: f32| rsi.scale.price(f64::from(y));
+        assert!((points[0].price - value(bottom)).abs() < 1e-6 && (points[1].price - value(top)).abs() < 1e-6, "its values, not prices");
+
+        // Kept, it stands in that pane, is caught there and nowhere over the candles.
+        let mut shape = DrawingShape::new(Some(7), DrawingKind::Trendline, points.clone());
+        shape.style.set("pane", "pct");
+        c.set_drawings(vec![shape]);
+        c.render(1_800_000_000_000);
+        let placed = c.place(&c.drawings[0], false).expect("placed");
+        assert_eq!(placed.plot, rsi.plot);
+        assert!((placed.points[0].1 - bottom).abs() < 0.5 && (placed.points[1].1 - top).abs() < 0.5);
+        let middle = ((placed.points[0].0 + placed.points[1].0) / 2.0, (placed.points[0].1 + placed.points[1].1) / 2.0);
+        assert_eq!(c.drawing_at(middle.0, middle.1), Some(7), "caught on its line");
+        let over_candles = price.plot.y + price.plot.h / 2.0;
+        assert_eq!(c.drawing_at(middle.0, over_candles), None);
+        // A click there picks it, and its handle drags it within the pane.
+        c.set_tool(None);
+        c.pointer_down(middle.0, middle.1, 0);
+        c.pointer_up(middle.0, middle.1);
+        assert_eq!(c.selected, Some(7));
+
+        // A brush likewise; a position, which is priced, is not placed there.
+        c.set_tool(Some(DrawingKind::Brush));
+        c.pointer_down(200.0, bottom, 0);
+        for i in 1..20 {
+            c.pointer_move(200.0 + i as f32 * 5.0, bottom - i as f32);
+        }
+        c.pointer_up(300.0, bottom - 20.0);
+        assert!(c.take_events().iter().any(|e| matches!(e, Event::DrawingCreated { kind: DrawingKind::Brush, pane: Some(Group::Pct), .. })));
+        c.set_tool(Some(DrawingKind::Long));
+        c.pointer_down(300.0, bottom, 0);
+        c.pointer_up(300.0, bottom);
+        assert!(!c.take_events().iter().any(|e| matches!(e, Event::DrawingCreated { .. })));
+
+        // The study gone, so is its drawing: it comes back with it.
+        c.set_studies("");
+        c.render(1_800_000_000_000);
+        assert!(c.place(&c.drawings[0], false).is_none());
+    }
+
+    #[test]
+    fn a_tap_pins_the_crosshair_a_finger_moves_it_and_a_tool_places_there() {
+        let mut c = chart();
+        c.render(1_800_000_000_000);
+        c.set_touch(true);
+        let tap = |c: &mut Chart, x: f32, y: f32| {
+            c.pointer_down(x, y, 0);
+            c.pointer_up(x, y);
+            c.pointer_leave();
+        };
+        tap(&mut c, 300.0, 200.0);
+        assert_eq!(c.crosshair, Some((300.0, 200.0)), "shown where tapped, and kept when the finger lifts");
+
+        // A finger anywhere moves it by its motion; the chart does not pan.
+        let before = c.time.right_offset;
+        c.pointer_down(500.0, 300.0, 0);
+        c.pointer_move(520.0, 290.0);
+        c.pointer_move(540.0, 280.0);
+        c.pointer_up(540.0, 280.0);
+        c.pointer_leave();
+        assert_eq!(c.crosshair, Some((340.0, 180.0)));
+        assert_eq!(c.time.right_offset, before);
+
+        tap(&mut c, 600.0, 300.0);
+        assert_eq!(c.crosshair, None, "the next tap puts it away");
+
+        // With a tool: the first tap shows it, a tap places an anchor where it stands, not under the finger.
+        c.set_tool(Some(DrawingKind::Trendline));
+        tap(&mut c, 300.0, 200.0);
+        assert!(c.placed.is_empty() && c.crosshair == Some((300.0, 200.0)));
+        tap(&mut c, 700.0, 350.0);
+        let first = c.anchor_at(300.0, 200.0).unwrap();
+        assert_eq!(c.placed, vec![first], "placed at the crosshair");
+        c.pointer_down(700.0, 350.0, 0);
+        c.pointer_move(760.0, 330.0);
+        c.pointer_up(760.0, 330.0);
+        tap(&mut c, 100.0, 100.0);
+        let events = c.take_events();
+        let Some(Event::DrawingCreated { points, .. }) = events.iter().find(|e| matches!(e, Event::DrawingCreated { .. })) else { panic!("{events:?}") };
+        assert_eq!(points[1], c.anchor_at(360.0, 180.0).unwrap());
+
+        // A mouse again: no pinned crosshair.
+        c.set_touch(false);
+        c.pointer_leave();
+        assert_eq!(c.crosshair, None);
+    }
+
+    #[test]
     fn a_held_finger_is_a_crosshair_and_with_a_tool_it_aims() {
         let mut c = chart();
         c.set_touch(true);
@@ -4748,7 +4991,7 @@ mod tests {
         aim(&mut c, (300.0, 300.0), (320.0, 250.0));
         aim(&mut c, (500.0, 300.0), (540.0, 200.0));
         let points = c.take_events().into_iter().find_map(|e| match e {
-            Event::DrawingCreated { kind: DrawingKind::Trendline, points } => Some(points),
+            Event::DrawingCreated { kind: DrawingKind::Trendline, points, .. } => Some(points),
             _ => None,
         });
         let points = points.expect("two holds placed a trend line");
@@ -4775,7 +5018,7 @@ mod tests {
             click(&mut c, x, 200.0);
         }
         assert!(c.key("Enter"));
-        assert!(matches!(&c.take_events()[0], Event::DrawingCreated { kind: DrawingKind::Path, points } if points.len() == 3));
+        assert!(matches!(&c.take_events()[0], Event::DrawingCreated { kind: DrawingKind::Path, points, .. } if points.len() == 3));
 
         c.set_tool(Some(DrawingKind::Brush));
         c.pointer_down(100.0, 100.0, 0);
@@ -4783,7 +5026,7 @@ mod tests {
             c.pointer_move(100.0 + i as f32 * 5.0, 100.0 + i as f32);
         }
         c.pointer_up(200.0, 120.0);
-        assert!(matches!(&c.take_events()[0], Event::DrawingCreated { kind: DrawingKind::Brush, points } if points.len() > 10));
+        assert!(matches!(&c.take_events()[0], Event::DrawingCreated { kind: DrawingKind::Brush, points, .. } if points.len() > 10));
     }
 
     #[test]
@@ -4904,6 +5147,19 @@ mod tests {
         assert!(!frame.colors.chunks(4).any(|c| *c == [accent.r, accent.g, accent.b, 205]), "not painted twice");
         let (x, y, ink, _) = c.legend().mark.expect("the page is told where");
         assert_eq!((x, y, ink), (price.x + 12.0, price.bottom() - 46.0, accent));
+
+        // Over a footprint's stats table it stood on the rows' names: it stands above the table.
+        c.set_footprint_shown(true);
+        c.set_footprint_options("delta;1;1;1");
+        let last = *c.candles().last().unwrap();
+        c.set_footprint(vec![footprint::Bar { time: last.open_time, levels: vec![(last.close.floor(), 1.0, 2.0)], ..Default::default() }], 1.0, false);
+        c.render(1_800_000_000_000);
+        let top = c.table_top().expect("the table is shown");
+        let (_, y, _, _) = c.legend().mark.expect("still there");
+        assert_eq!(y, top - 46.0);
+        c.set_footprint_options("delta;1;0;1");
+        c.render(1_800_000_000_000);
+        assert_eq!(c.legend().mark.map(|m| m.1), Some(c.panes[0].plot.bottom() - 46.0), "back down with the table off");
     }
 
     #[test]
