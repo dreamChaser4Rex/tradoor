@@ -96,6 +96,13 @@ interface ProfileSpec {
 const scope = self as unknown as { postMessage(msg: FromWorker): void; onmessage: ((e: MessageEvent<ToWorker>) => void) | null };
 const post = (msg: FromWorker): void => scope.postMessage(msg);
 const message = (e: unknown): string => (e instanceof Error ? e.message : String(e));
+/**
+ * When a load that failed is tried again by itself: a throttled exchange once
+ * it may be asked, one down or out of reach a little later. Before, the
+ * chart stayed blank until the page was reloaded.
+ */
+const againAt = (e: unknown): number =>
+  (e as { until?: number } | null)?.until || (/answered (429|5\d\d)|timed out|abort|fetch|network|load failed/i.test(message(e)) ? Date.now() + 15_000 : 0);
 const EMPTY = new Float64Array(0);
 /** An alert line's style as the engine reads it: see `set_alerts`. */
 const DASHES: Record<string, number> = { solid: 1, dashed: 2, dotted: 3 };
@@ -297,6 +304,8 @@ class Slot {
       schedule();
     }, { signal });
     this.engine = new ChartEngine(gl, textCanvas, feedCanvas, '1h', flat);
+    // The page draws the mark, to move it (components/ChartMark); a capture paints its own.
+    this.engine.set_page_mark(true);
     for (const [key, value] of theme) this.engine.set_theme_value(key, value);
     this.engine.set_utc_offset(utcOffset);
     // Every exchange's mark, once: a liquidation names the one it came from.
@@ -349,6 +358,24 @@ class Slot {
     this.engine.set_studies(value);
     this.metaDirty = true;
     this.syncOpenInterest();
+    this.reach();
+  }
+
+  /** The base bars asked for so far, for a weekly VWAP. */
+  private reached = 0;
+
+  /**
+   * A VWAP draws nothing for a period whose open the chart does not hold: a
+   * weekly one on a short chart has its history reach back to the week's
+   * open, as the window at rest already does — a minute chart loaded a day,
+   * and its weekly VWAP was gone from Tuesday. Asked once the history is in,
+   * so a study set while it loads is seen then.
+   */
+  private reach(): void {
+    const series = this.series;
+    if (!series || this.status.loading || !Number.isFinite(this.rest) || !/(^|,)vwap:1/.test(this.studies)) return;
+    const need = baseBars(series, info(this.timeframe), this.rest);
+    if (need > this.reached) void series.ensure((this.reached = need)).catch(() => undefined);
   }
 
   /** Open interest follows the chart's market, bars and the study's venues. */
@@ -473,6 +500,7 @@ class Slot {
     if (market === this.market && timeframe === this.timeframe && bars === this.bars && !this.status.error) return;
     this.detach();
     const gen = this.gen;
+    this.reached = 0;
     this.market = market;
     this.timeframe = timeframe;
     this.bars = bars;
@@ -515,10 +543,11 @@ class Slot {
       await series.ensure(baseBars(series, tf, bars) + this.replayBack(series));
       if (gen !== this.gen) return;
       this.refold();
+      this.reach();
       if (this.replayAt !== null) this.postReplay();
       if (!early) this.startLive(gen, tf);
     } catch (e) {
-      if (gen === this.gen) this.fail(message(e));
+      if (gen === this.gen) this.fail(message(e), againAt(e));
     }
   }
 
@@ -559,12 +588,19 @@ class Slot {
     this.setStatus({ loading: false, error: `not loaded: ${message(e)}` });
   }
 
-  private fail(error: string): void {
+  /** `again`: when to load once more by itself, counted down on the chart; 0 for never. */
+  private fail(error: string, again = 0): void {
     this.fresh = false;
     this.engine.set_loading(false);
     this.engine.set_candles(EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY);
     this.engine.set_message(`Could not load candles — ${error}`);
     this.setStatus({ loading: false, error });
+    if (!again) return;
+    const { gen, market, timeframe, bars } = this;
+    const tick = (): unknown =>
+      gen === this.gen &&
+      (again > Date.now() ? (this.engine.set_message(`Could not load candles — ${error} · trying again in ${Math.ceil((again - Date.now()) / 1000)} s`), setTimeout(tick, 1000)) : this.load(market, timeframe, bars));
+    tick();
   }
 
   private lastClosedTime(): number {
@@ -1154,7 +1190,7 @@ const MAX_CAPTURE_SCALE = 6;
  * pixels across. Nothing on screen changes: the engine goes back to the size it
  * was at the moment it is done.
  */
-async function captureCall({ id, wide }: Calls['capture']['args']): Promise<Blob> {
+async function captureCall({ id, wide }: Calls['capture']['args']): Promise<Calls['capture']['result']> {
   const slot = slots.get(id);
   if (!slot) throw new Error('that chart is not open');
   const { width, height, dpr } = slot.size();
@@ -1170,7 +1206,8 @@ async function captureCall({ id, wide }: Calls['capture']['args']): Promise<Blob
   if (!ctx) throw new Error('this browser will not draw the picture');
   ctx.drawImage(shapes, 0, 0);
   ctx.drawImage(labels, 0, 0);
-  return await out.convertToBlob({ type: 'image/png' });
+  // Made a PNG on the page, once its title is on.
+  return { picture: out.transferToImageBitmap(), px: dpr * scale };
 }
 
 async function answer(req: number, name: CallName, args: unknown): Promise<void> {
@@ -1380,6 +1417,9 @@ function handle(msg: ToWorker): void {
       break;
     case 'range':
       slot.engine.show_range(msg.days ?? Number.NaN);
+      break;
+    case 'span':
+      slot.engine.show_span(msg.from, msg.to);
       break;
     case 'pointer':
       slot.pointer(msg.kind, msg.x, msg.y, msg.button, msg.shift, msg.ctrl, msg.touch);

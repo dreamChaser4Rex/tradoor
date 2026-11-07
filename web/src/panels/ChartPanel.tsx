@@ -5,7 +5,7 @@
  */
 import { batch, createEffect, createMemo, createSignal, For, type JSX, on, onCleanup, onMount, Show, untrack } from 'solid-js';
 import { lazy } from '../lib/lazy';
-import { armedTool, chartControllers, controllersChanged, covered, drawingsChanged, magnet, mobile, setArmedTool, setControllersChanged, setDrawingsChanged, setMobileMenu, setOverlay, setShownPattern, setStudyEditing, sharedRail, shownPattern, studyEditing, type ShownPattern } from '../app/ui';
+import { armedTool, chartControllers, controllersChanged, covered, drawingsChanged, magnet, mobile, setArmedTool, setControllersChanged, setDrawingsChanged, setMobileMenu, setOverlay, setShownPattern, setShownTrades, setStudyEditing, sharedRail, shownPattern, shownTrades, studyEditing, type ShownPattern, type ShownTrades } from '../app/ui';
 import { DrawingRail } from './DrawingRail';
 import { call, debugClient, heardAt, holdChart, lastPrice, releaseChart, send } from '../engine/client';
 import type { ChartEvent, ChartStatus, DrawingPoint, Legend, LiveStatus, PointerKind, ReplayState, StudyMeta, TpoHover } from '../engine/protocol';
@@ -29,7 +29,7 @@ import { Icon } from '../lib/icons';
 import { VenueTag } from '../lib/exchanges';
 import { WatchlistToggle } from '../components/WatchlistToggle';
 import { liquidationVenues } from '../lib/liquidation-venues';
-import { formatClock, formatDateTime, formatFileTime, zoneLabel } from '../lib/timezone';
+import { formatAlertTime, formatClock, formatDateTime, formatFileTime, timeZone, zoneLabel } from '../lib/timezone';
 import { dropOwner, numberOf, plotStyle, serializeStyles, splitList, withoutLayer } from '../lib/study-style';
 import { serializeTpo, tpoValue, withTpoValue } from '../lib/tpo-settings';
 import { isRatio, symbolOf, venueLabel } from '../lib/markets';
@@ -44,6 +44,7 @@ import { behindMaximized, doc, marketOf, maximized, patchPanel, setPanelTimefram
 const DrawingSettings = lazy(() => import('../components/DrawingSettings').then((m) => ({ default: m.DrawingSettings })));
 const StudySettings = lazy(() => import('../components/StudySettings').then((m) => ({ default: m.StudySettings })));
 const AlertStyleSettings = lazy(() => import('../components/AlertStyleSettings').then((m) => ({ default: m.AlertStyleSettings })));
+const ChartMark = lazy(() => import('../components/ChartMark').then((m) => ({ default: m.ChartMark })));
 const DrawingToolbar = lazy(() => import('../components/DrawingToolbar').then((m) => ({ default: m.DrawingToolbar })));
 
 
@@ -286,7 +287,7 @@ export function ChartPanel(props: { panel: ChartPanelState; training?: TrainingC
    * What the footprint is doing, said in the legend, and how far along a thin
    * line over the chart shows: a share done, `busy` while there is no telling, or none.
    */
-  const fpNote = (): { text: string; tip: string; progress: number | 'busy' | null } | null => {
+  const fpNote = (): { text: string; tip: string; progress: number | 'busy' | null; warn?: true } | null => {
     if (!footprintOn() && !tpoFlow()) return null;
     if (replaying() && fpNone() && !fpLoading()) return { text: 'no footprint this far back', tip: 'The server keeps footprint minutes for a month, and hours for good only where they were archived. These bars replay as candles.', progress: null };
     const venue = venueLabel(market());
@@ -303,6 +304,17 @@ export function ChartPanel(props: { panel: ChartPanelState; training?: TrainingC
     }
     if (fpLoading()) return { text: 'reading footprint…', tip: 'What this browser recorded, from its own storage', progress: 'busy' };
     if (!status?.live) return { text: `footprint: connecting to ${venue}…`, tip: 'Trades come from the exchange itself, the same socket as the DOM and tape', progress: 'busy' };
+    // Binance kept its history from this network: said, or the bars it would fill look like a footprint gone wrong.
+    const stopped = status.stopped;
+    if (stopped) {
+      const why = { refused: 'refuses its trade history to', throttled: 'is limiting calls from', unreachable: 'does not answer' }[stopped.why];
+      return {
+        text: `Binance ${why} this network (a VPN?) · trying again at ${formatClock(stopped.retry).slice(0, 5)}`,
+        tip: 'Bars this browser did not record come from Binance\'s trade history, and none came: a VPN, a firewall or a region Binance does not serve keeps it away. Those bars stay candles until a call gets through.',
+        progress: null,
+        warn: true,
+      };
+    }
     const since = fpSince();
     if (since === null) return { text: 'footprint: recording, the first cells come with the next trades', tip: 'Recorded in this browser from now on', progress: null };
     const at = Date.now() - since < 86_400_000 ? formatClock(since).slice(0, 5) : formatDateTime(since).slice(0, 16);
@@ -810,6 +822,7 @@ export function ChartPanel(props: { panel: ChartPanelState; training?: TrainingC
           .filter((d) => visibleOn(d.style, tf))
           .map((d) => ({ id: d.id, kind: d.kind, points: d.points, label: d.label, style: d.style, timeframe: d.timeframe })),
         ...(p ? patternParts(p).map((d, i) => ({ id: -1_000_000 - i, ...d, style: { ...d.style, locked: true } })) : []),
+        ...(traded()?.parts ?? []).map((d, i) => ({ id: -3_000_000 - i, ...d, style: { ...d.style, locked: true } })),
         ...(props.training?.overlay() ?? []).map((d, i) => ({ id: -2_000_000 - i, ...d, style: { ...d.style, locked: true } })),
       ],
     });
@@ -844,6 +857,37 @@ export function ChartPanel(props: { panel: ChartPanelState; training?: TrainingC
     setShownPattern(null);
     void (async () => {
       for (const part of patternParts(p)) await saveDrawing(part);
+    })();
+  };
+
+  // ---------------------------------------------------------------- journal trades shown
+
+  /** The journal's trades drawn where they went, on this chart when it is on their market's candles. */
+  const traded = () => {
+    const s = shownTrades();
+    return s && !props.training && s.market === market() && chartKind() === 'candles' ? s : null;
+  };
+  // Brought into view once its market's bars of their length are in: from the first entry to the last close.
+  let framedTrades: ShownTrades | null = null;
+  createEffect(() => {
+    const s = traded();
+    const st = status();
+    // On the bars of the length the chart is at: the one asked for, unless the chart could not take it.
+    if (!s || s === framedTrades || st.loading || st.bars === 0 || st.market !== s.market || st.timeframe !== timeframe()) return;
+    framedTrades = s;
+    send({ t: 'span', id: sid, from: s.from, to: s.to });
+  });
+  createEffect(
+    on(market, (m, prev) => {
+      const s = untrack(shownTrades);
+      if (s && prev === s.market && m !== s.market) setShownTrades(null);
+    }, { defer: true }),
+  );
+  /** Saved as this chart's own drawings: pictures of the trades, which the journal does not take for new ones. */
+  const keepTrades = (s: ShownTrades) => {
+    setShownTrades(null);
+    void (async () => {
+      for (const part of s.parts) await saveDrawing(part);
     })();
   };
 
@@ -1022,7 +1066,20 @@ export function ChartPanel(props: { panel: ChartPanelState; training?: TrainingC
   }
 
   /** A picture of this chart, to the clipboard — or to a file when `save`. */
-  const capture = (save: boolean) => captureChart(sid, `tradoor ${symbolOf(market())} ${tfLabel(timeframe())} ${formatFileTime(Date.now())}.png`, save);
+  const capture = (save: boolean) => {
+    const l = legend();
+    const at = replayAt();
+    const tpo = split() ? ` · TPO ${TPO_SPLITS.find((t) => t.value === split())?.label}` : '';
+    const title = {
+      symbol: symbolOf(market()),
+      detail: `${tfLabel(timeframe())}${tpo} · ${venueLabel(market())}`,
+      ohlc: l?.ohlc ?? '',
+      change: l?.change ?? '',
+      up: l?.up !== false,
+      time: `${at === null ? '' : 'Replay · '}${formatAlertTime(at ?? Date.now())} ${zoneLabel(timeZone())}`,
+    };
+    captureChart(sid, `tradoor ${symbolOf(market())} ${tfLabel(timeframe())} ${formatFileTime(Date.now())}.png`, title, save);
+  };
 
   const undo = () => {
     const step = history.takeUndo();
@@ -1683,9 +1740,24 @@ export function ChartPanel(props: { panel: ChartPanelState; training?: TrainingC
               </div>
             )}
           </Show>
+          <Show when={traded()}>
+            {(s) => (
+              <div class="pattern-bar" onPointerDown={(e) => e.stopPropagation()}>
+                <span>{s().title}</span>
+                <span class={s().tone}>{s().summary}</span>
+                <button class="tb" data-tip="Save them as drawings on this chart: pictures of these trades, not new ones" onClick={() => keepTrades(s())}>
+                  Save drawings
+                </button>
+                <button class="iconbtn" aria-label="Close the trades" data-tip="Close — nothing is saved" onClick={() => setShownTrades(null)}>
+                  <Icon name="close" size={11} />
+                </button>
+              </div>
+            )}
+          </Show>
           <Show when={editing() === null && selectedDrawing()}>
             {(d) => <DrawingToolbar drawing={d()} onRestyle={(patch) => restyle(d(), patch)} onSettings={() => setEditing(d().id)} onDelete={() => void deleteDrawing(d().id)} />}
           </Show>
+          <Show when={legend()?.mark}>{(m) => <ChartMark x={m().x} y={m().y} accent={m().accent} bear={m().bear} paused={paused()} />}</Show>
           <Show when={clock()}>
             {(c) => (
               <button
@@ -1781,7 +1853,7 @@ export function ChartPanel(props: { panel: ChartPanelState; training?: TrainingC
                 {split() ? ` · TPO ${TPO_SPLITS.find((t) => t.value === split())?.label}` : ''} · {venueLabel(market())}
                 <Show when={fpNote()}>
                   {(note) => (
-                    <span class="dim" data-tip={note().tip}>
+                    <span class="dim" classList={{ warn: note().warn }} data-tip={note().tip}>
                       {` · ${note().text}`}
                     </span>
                   )}

@@ -7,20 +7,24 @@
  * is kept for an account: until the browser signs in with Telegram, it shows
  * how, and nothing is written down.
  */
-import { createMemo, createSignal, For, type JSX, Match, onCleanup, onMount, Show, Switch } from 'solid-js';
+import { batch, createMemo, createSignal, For, type JSX, Match, onCleanup, onMount, Show, Switch } from 'solid-js';
 import { Portal } from 'solid-js/web';
-import { setDrawingsChanged, setJournalOpen } from '../app/ui';
+import { setDrawingsChanged, setJournalOpen, setShownPattern, setShownTrades } from '../app/ui';
 import { AccountCard } from '../components/Account';
 import { NumField } from '../components/NumField';
 import { SymbolSearch } from '../components/SymbolSearch';
 import { api, catalog, errorText, type AccountStatus } from '../lib/api';
+import { readPref, writePref } from '../lib/prefs';
 import { rememberSize } from '../lib/drawing-options';
 import { defaultStyle } from '../lib/drawing-style';
-import { formatPrice } from '../lib/format';
+import { formatPrice, roughDecimals } from '../lib/format';
 import { VenueTag } from '../lib/exchanges';
 import { Icon } from '../lib/icons';
 import { isMarket, symbolOf, venueLabel } from '../lib/markets';
-import { focusPanel, marketOf, setPanelMarket, setPanelTimeframe, targetChart } from '../workspace/store';
+import { activate, tabsOf, type ChartPanelState } from '../workspace/model';
+import { doc, focusPanel, marketOf, setPanelMarket, setPanelTimeframe, targetChart, update } from '../workspace/store';
+import { smoothPath } from './curve';
+import { frameFor, marketOf as marketOfTrades, summaryOf, tradePicture } from './picture';
 import { cents, coinsFor, figures, figuresOf, fits, lossPerCoin, marginFor, type DrawnLeg } from './legs';
 import { Readout } from './Readout';
 import { StrategyPicker } from './strategies';
@@ -78,6 +82,40 @@ export function Journal() {
   const [error, setError] = createSignal<string | null>(null);
   const [loaded, setLoaded] = createSignal(false);
   const [tab, setTab] = createSignal<Tab>('dashboard');
+  const [focus, setFocus] = createSignal<Focus | null>(null);
+  let body: HTMLDivElement | undefined;
+  /** The trades as History lists them, drawn on the chart where each went, and the journal out of the way. */
+  /** The chart in use if it draws candles, else the first on screen that does: a TPO profile draws no positions. */
+  const candleChart = (): ChartPanelState | null => {
+    const used = targetChart();
+    if (used && !used.tpo) return used;
+    const charts = Object.values(doc.panels).filter((p): p is ChartPanelState => p.type === 'chart' && !p.tpo);
+    return charts.find((p) => tabsOf(doc.root, p.id)?.active === p.id) ?? charts[0] ?? used;
+  };
+  const showOnChart = (list: Trade[]) => {
+    const chart = candleChart();
+    const now = Date.now();
+    const picture = tradePicture(list, now);
+    const on = marketOfTrades(list);
+    if (!chart || !picture || !on) return;
+    const timeframe = frameFor(picture.from, picture.to, now);
+    const tabs = tabsOf(doc.root, chart.id);
+    batch(() => {
+      if (tabs && tabs.active !== chart.id) update((d) => activate(d, tabs.id, chart.id));
+      setShownPattern(null);
+      setShownTrades({ market: on, timeframe, from: picture.from, to: picture.to, parts: picture.parts, title: symbolOf(on), summary: summaryOf(picture), tone: picture.pnl > 0 ? 'bull' : picture.pnl < 0 ? 'bear' : '' });
+      if (marketOf(chart) !== on) setPanelMarket(chart.id, on);
+      setPanelTimeframe(chart.id, timeframe);
+      focusPanel(chart.id);
+    });
+    setJournalOpen(false);
+  };
+  /** One row of the breakdown's trades, in History, from its top. */
+  const openFocus = (f: Focus) => {
+    setFocus(f);
+    setTab('history');
+    body?.scrollTo({ top: 0 });
+  };
   const [selected, setSelected] = createSignal<number | null>(null);
   const [adding, setAdding] = createSignal(false);
   const [decimals, setDecimals] = createSignal(new Map<string, number>());
@@ -104,8 +142,17 @@ export function Journal() {
     }
     await load();
   };
+  // Each market's tick, so a dragged anchor's 81,234.56789 reads as the exchange quotes it;
+  // asked again with the trades while the first asking has not answered.
+  const readDecimals = () =>
+    void catalog()
+      .then((c) => setDecimals(new Map(c.products.flatMap((p) => (p.priceDecimals === null ? [] : [[p.market, p.priceDecimals] as [string, number]])))))
+      .catch(() => {});
   /** Whatever is still to be read: the account while that is unknown, then the trades. */
-  const refresh = () => (account() ? load() : readAccount());
+  const refresh = () => {
+    if (decimals().size === 0) readDecimals();
+    return account() ? load() : readAccount();
+  };
   onMount(() => {
     void readAccount();
     // Asked again only while the page is in view, and either a first read has
@@ -121,10 +168,7 @@ export function Journal() {
       clearInterval(timer);
       document.removeEventListener('visibilitychange', shown);
     });
-    // Each market's tick, so a dragged anchor's 81,234.56789 reads as the exchange quotes it.
-    void catalog()
-      .then((c) => setDecimals(new Map(c.products.flatMap((p) => (p.priceDecimals === null ? [] : [[p.market, p.priceDecimals] as [string, number]])))))
-      .catch(() => {});
+    readDecimals();
   });
   const onKey = (e: KeyboardEvent) => {
     if (e.key !== 'Escape') return;
@@ -137,7 +181,9 @@ export function Journal() {
     onCleanup(() => window.removeEventListener('keydown', onKey));
   });
 
-  const price = (market: string, v: number | null) => formatPrice(v, decimals().get(market));
+  /** A market's own decimals; where those are not known, by the price's size, never by its float tail. */
+  const digits = (market: string, v: number) => decimals().get(market) ?? roughDecimals(v);
+  const price = (market: string, v: number | null) => formatPrice(v, v === null ? undefined : digits(market, v));
   const replace = (t: Trade) => setTrades((list) => list.map((x) => (x.id === t.id ? t : x)));
   const current = () => trades().find((t) => t.id === selected());
   const waiting = () => <p class="jr-empty muted">{error() ? 'Not read yet. Asking again shortly…' : 'Reading…'}</p>;
@@ -178,7 +224,7 @@ export function Journal() {
           </div>
         )}
       </Show>
-      <div class="jr-body">
+      <div class="jr-body" ref={body}>
         <Show when={account()} fallback={waiting()}>
           <Show when={signedIn()} fallback={<SignInFirst onSignedIn={() => void readAccount()} />}>
             <Show when={!loaded() && tab() !== 'review'}>{waiting()}</Show>
@@ -193,10 +239,10 @@ export function Journal() {
             </Show>
             <Switch>
               <Match when={tab() === 'dashboard' && trades().length > 0}>
-                <Dashboard trades={trades()} price={price} onSelect={setSelected} onAll={() => setTab('history')} />
+                <Dashboard trades={trades()} price={price} onSelect={setSelected} onAll={() => setTab('history')} onFocus={openFocus} />
               </Match>
               <Match when={tab() === 'history' && trades().length > 0}>
-                <History trades={trades()} price={price} onSelect={setSelected} />
+                <History trades={trades()} price={price} onSelect={setSelected} focus={focus()} onUnfocus={() => setFocus(null)} onChart={showOnChart} />
               </Match>
               <Match when={tab() === 'review'}>
                 <ReviewTab trades={trades()} />
@@ -210,6 +256,7 @@ export function Journal() {
           <Editor
             trade={t()}
             price={price}
+            digits={digits}
             onClose={() => setSelected(null)}
             onChange={replace}
             onRemove={(id) => {
@@ -260,7 +307,7 @@ const PERIODS: [string, string][] = [
  * it, the curve that got there, then where it was made and the latest trades.
  * The period above scopes all of it.
  */
-function Dashboard(props: { trades: Trade[]; price: (market: string, v: number | null) => string; onSelect: (id: number) => void; onAll: () => void }) {
+function Dashboard(props: { trades: Trade[]; price: (market: string, v: number | null) => string; onSelect: (id: number) => void; onAll: () => void; onFocus: (f: Focus) => void }) {
   const [period, setPeriod] = createSignal('all');
   const list = createMemo(() => {
     const p = period();
@@ -369,7 +416,7 @@ function Dashboard(props: { trades: Trade[]; price: (market: string, v: number |
             <Calendar trades={list()} />
           </section>
           <section class="jx-box">
-            <Breakdown trades={list()} />
+            <Breakdown trades={list()} onFocus={props.onFocus} />
           </section>
         </div>
 
@@ -426,9 +473,9 @@ function Equity(props: { trades: Trade[] }) {
     // All in the one minute: evenly, for want of a span.
     const x = (at: number, i: number) => (to > from ? ((at - from) / (to - from)) * 100 : ((i + 1) / c.length) * 100);
     const points = c.map((p, i) => ({ x: x(p.at, i), y: y(p.total) }));
-    const line = [`0,${y(0)}`, ...points.map((p) => `${p.x},${p.y}`)].join(' ');
+    const line = smoothPath([{ x: 0, y: y(0) }, ...points]);
     const labels = to - from < 36 * 3_600_000 ? (at: number) => stamp(at).slice(6) : dayMonth;
-    return { zero: y(0), ticks: ticks.map((v) => ({ v, y: y(v) })), points, line, area: `0,${y(0)} ${line} 100,${y(0)}`, last: c[c.length - 1]!.total, days: [0, 1, 2, 3].map((i) => ({ x: (i / 3) * 100, label: labels(from + ((to - from) * i) / 3) })) };
+    return { zero: y(0), ticks: ticks.map((v) => ({ v, y: y(v) })), points, line, area: `${line}L100,${y(0)}L0,${y(0)}Z`, last: c[c.length - 1]!.total, days: [0, 1, 2, 3].map((i) => ({ x: (i / 3) * 100, label: labels(from + ((to - from) * i) / 3) })) };
   });
   const [hover, setHover] = createSignal<number | null>(null);
   const nearest = (e: PointerEvent & { currentTarget: HTMLElement }) => {
@@ -467,12 +514,12 @@ function Equity(props: { trades: Trade[] }) {
             <rect x="-1" y={shape().zero} width="102" height={101 - shape().zero} />
           </clipPath>
           <g clip-path="url(#jx-above)">
-            <polygon points={shape().area} class="jx-area up" />
-            <polyline points={shape().line} class="jx-line up" vector-effect="non-scaling-stroke" />
+            <path d={shape().area} class="jx-area up" />
+            <path d={shape().line} class="jx-line up" vector-effect="non-scaling-stroke" />
           </g>
           <g clip-path="url(#jx-below)">
-            <polygon points={shape().area} class="jx-area down" />
-            <polyline points={shape().line} class="jx-line down" vector-effect="non-scaling-stroke" />
+            <path d={shape().area} class="jx-area down" />
+            <path d={shape().line} class="jx-line down" vector-effect="non-scaling-stroke" />
           </g>
         </svg>
         <Show when={!at()}>
@@ -504,8 +551,18 @@ function Equity(props: { trades: Trade[] }) {
 const WEEKDAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
 
-/** A month of days, each with what its closed trades made, and each week's R beside it. */
+const CAL_UNIT_KEY = 'journal-calendar-unit';
+
+/** A month of days, each with what its closed trades made and each week's beside it, in money or in R. */
 function Calendar(props: { trades: Trade[] }) {
+  const [unit, setUnit] = createSignal<'usd' | 'r'>(readPref(CAL_UNIT_KEY) === 'r' ? 'r' : 'usd');
+  const pick = (u: 'usd' | 'r') => {
+    setUnit(u);
+    writePref(CAL_UNIT_KEY, u);
+  };
+  /** What a day or a week shows: its money, or its R. */
+  const measure = (d: { pnl: number; r: number }) => (unit() === 'r' ? d.r : d.pnl);
+  const figure = (v: number, short: boolean) => (unit() === 'r' ? rText(v) : short ? compactMoney(v) : money(v));
   // It opens on the last month anything closed in, not on an empty one.
   const last = new Date(Math.max(0, ...props.trades.filter(isClosed).map(when)) || Date.now());
   const [month, setMonth] = createSignal({ y: last.getFullYear(), m: last.getMonth() });
@@ -523,11 +580,16 @@ function Calendar(props: { trades: Trade[] }) {
     Array.from({ length: cells().length / 7 }, (_, i) => {
       const row = cells().slice(i * 7, i * 7 + 7);
       const traded = row.map((day) => (day ? days().get(day) : undefined)).filter((d) => d !== undefined);
-      return { row, r: traded.reduce((sum, d) => sum + d.r, 0), trades: traded.reduce((sum, d) => sum + d.trades, 0), first: row.find((day) => day !== null)! };
+      return { row, r: traded.reduce((sum, d) => sum + d.r, 0), pnl: traded.reduce((sum, d) => sum + d.pnl, 0), trades: traded.reduce((sum, d) => sum + d.trades, 0), first: row.find((day) => day !== null)! };
     }),
   );
-  const total = createMemo(() => cells().reduce((sum, day) => sum + (day ? (days().get(day)?.pnl ?? 0) : 0), 0));
-  const biggest = createMemo(() => Math.max(1, ...cells().map((day) => Math.abs(day ? (days().get(day)?.pnl ?? 0) : 0))));
+  const inMonth = createMemo(() => cells().reduce((sum, day) => {
+    const d = day ? days().get(day) : undefined;
+    return d ? { pnl: sum.pnl + d.pnl, r: sum.r + d.r } : sum;
+  }, { pnl: 0, r: 0 }));
+  const total = () => measure(inMonth());
+  // The shade is by what is shown: the day that made the most in R need not be the one that made the most money.
+  const biggest = createMemo(() => Math.max(unit() === 'r' ? 0.01 : 1, ...cells().map((day) => Math.abs(day && days().get(day) ? measure(days().get(day)!) : 0))));
   const step = (n: number) => setMonth(({ y, m }) => ({ y: m + n < 0 ? y - 1 : m + n > 11 ? y + 1 : y, m: (m + n + 12) % 12 }));
   const now = localDay(Date.now());
   return (
@@ -543,7 +605,15 @@ function Calendar(props: { trades: Trade[] }) {
           ›
         </button>
         <span class="grow" />
-        <span class={`num ${tone(total())}`}>{money(total())}</span>
+        <span class={`num ${tone(total())}`}>{figure(total(), false)}</span>
+        <div class="jh-sides jx-unit">
+          <button classList={{ on: unit() === 'usd' }} aria-pressed={unit() === 'usd'} data-tip="Each day in money" onClick={() => pick('usd')}>
+            $
+          </button>
+          <button classList={{ on: unit() === 'r' }} aria-pressed={unit() === 'r'} data-tip="Each day in R: what it made against what it risked" onClick={() => pick('r')}>
+            R
+          </button>
+        </div>
       </div>
       <div class="jx-cal-grid">
         <For each={WEEKDAYS}>{(d) => <span class="jx-wd">{d}</span>}</For>
@@ -554,26 +624,26 @@ function Calendar(props: { trades: Trade[] }) {
               <For each={week.row}>
                 {(day) => {
                   const d = () => (day ? days().get(day) : undefined);
-                  const strength = () => Math.min(1, Math.abs(d()?.pnl ?? 0) / biggest());
+                  const strength = () => Math.min(1, Math.abs(d() ? measure(d()!) : 0) / biggest());
                   return (
                     <div
                       class="jx-day"
-                      classList={{ blank: !day, up: (d()?.pnl ?? 0) > 0, down: (d()?.pnl ?? 0) < 0, today: day === now }}
+                      classList={{ blank: !day, up: (d() ? measure(d()!) : 0) > 0, down: (d() ? measure(d()!) : 0) < 0, today: day === now }}
                       style={{ '--s': String(0.1 + strength() * 0.22) }}
-                      data-tip={d() ? `${day}: ${money(d()!.pnl)} from ${d()!.trades} trade${d()!.trades > 1 ? 's' : ''}` : undefined}
+                      data-tip={d() ? `${day}: ${money(d()!.pnl)} · ${rText(d()!.r)} from ${d()!.trades} trade${d()!.trades > 1 ? 's' : ''}` : undefined}
                     >
                       <Show when={day}>
                         <span class="jx-date">{Number(day!.slice(8))}</span>
                         <Show when={d()}>
-                          <span class={`num ${tone(d()!.pnl)}`}>{compactMoney(d()!.pnl)}</span>
+                          <span class={`num ${tone(measure(d()!))}`}>{figure(measure(d()!), true)}</span>
                         </Show>
                       </Show>
                     </div>
                   );
                 }}
               </For>
-              <div class={`jx-week num ${week.trades > 0 ? tone(week.r) : 'dim'}`} data-tip={week.trades > 0 ? `Week of ${week.first}: ${rText(week.r)} from ${week.trades} trade${week.trades > 1 ? 's' : ''}` : undefined}>
-                {week.trades > 0 ? rText(week.r) : '—'}
+              <div class={`jx-week num ${week.trades > 0 ? tone(measure(week)) : 'dim'}`} data-tip={week.trades > 0 ? `Week of ${week.first}: ${money(week.pnl)} · ${rText(week.r)} from ${week.trades} trade${week.trades > 1 ? 's' : ''}` : undefined}>
+                {week.trades > 0 ? figure(measure(week), true) : '—'}
               </div>
             </>
           )}
@@ -590,16 +660,24 @@ function compactMoney(v: number): string {
   return `${sign}${a >= 1000 ? `${(a / 1000).toFixed(1)}K` : a.toFixed(a >= 100 ? 0 : 1)}`;
 }
 
-const BREAKDOWNS: { id: string; label: string; key: (t: Trade) => string }[] = [
+type BreakdownId = 'pair' | 'side' | 'strategy';
+/** History narrowed to one row of the breakdown: one pair's trades, one side's, one strategy's. */
+interface Focus {
+  by: BreakdownId;
+  value: string;
+}
+
+const BREAKDOWNS: { id: BreakdownId; label: string; key: (t: Trade) => string }[] = [
   { id: 'pair', label: 'Pair', key: (t) => symbolOf(t.market) },
   { id: 'side', label: 'Side', key: (t) => (t.side === 'long' ? 'Long' : 'Short') },
   { id: 'strategy', label: 'Strategy', key: (t) => t.strategy || 'No strategy' },
 ];
 
-/** Where it was made: closed trades by pair, side or strategy, each one's net as a bar from zero. */
-function Breakdown(props: { trades: Trade[] }) {
+/** Where it was made: closed trades by pair, side or strategy, each one's net as a bar from zero, each opening its trades. */
+function Breakdown(props: { trades: Trade[]; onFocus: (f: Focus) => void }) {
   const [by, setBy] = createSignal(BREAKDOWNS[0]!);
-  const groups = createMemo(() => groupBy(props.trades, by().key).slice(0, 10));
+  const groups = createMemo(() => groupBy(props.trades, by().key));
+  const open = (key: string) => props.onFocus({ by: by().id, value: key });
   const scale = createMemo(() => {
     const neg = Math.max(0, ...groups().map((g) => -g.pnl));
     const pos = Math.max(0, ...groups().map((g) => g.pnl));
@@ -619,6 +697,7 @@ function Breakdown(props: { trades: Trade[] }) {
           </For>
         </div>
       </header>
+      <div class="jx-scroll">
       <table class="jx-table num">
         <thead>
           <tr>
@@ -632,7 +711,18 @@ function Breakdown(props: { trades: Trade[] }) {
         <tbody>
           <For each={groups()}>
             {(g) => (
-              <tr>
+              <tr
+                class="go"
+                tabIndex={0}
+                data-tip={`Every ${g.key} trade, in History`}
+                onClick={() => open(g.key)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    open(g.key);
+                  }
+                }}
+              >
                 <td class="name">{g.key}</td>
                 <td>{g.trades}</td>
                 <td>{g.winRate.toFixed(0)}%</td>
@@ -647,6 +737,7 @@ function Breakdown(props: { trades: Trade[] }) {
           </For>
         </tbody>
       </table>
+      </div>
     </>
   );
 }
@@ -678,14 +769,20 @@ const clock = (ms: number): string => stamp(ms).slice(6);
  * Every trade, as a statement reads: those still to play out on top, then the
  * rest by the day each closed — the latest first — with what the day made.
  */
-function History(props: { trades: Trade[]; price: (market: string, v: number | null) => string; onSelect: (id: number) => void }) {
+function History(props: { trades: Trade[]; price: (market: string, v: number | null) => string; onSelect: (id: number) => void; focus: Focus | null; onUnfocus: () => void; onChart: (trades: Trade[]) => void }) {
   const [view, setView] = createSignal<View>('all');
   const [side, setSide] = createSignal<'all' | Side>('all');
   const [query, setQuery] = createSignal('');
-  // The side and the search narrow everything, the counts too; the view picks among what is left.
+  const focused = createMemo(() => {
+    const f = props.focus;
+    const key = f && BREAKDOWNS.find((b) => b.id === f.by)?.key;
+    return f && key ? { label: f.value, by: BREAKDOWNS.find((b) => b.id === f.by)!.label, test: (t: Trade) => key(t) === f.value } : null;
+  });
+  // The focus, the side and the search narrow everything, the counts too; the view picks among what is left.
   const pool = createMemo(() => {
     const q = query().trim().toUpperCase();
-    return props.trades.filter((t) => (side() === 'all' || t.side === side()) && (!q || t.market.toUpperCase().includes(q) || t.strategy.toUpperCase().includes(q) || t.notes.toUpperCase().includes(q)));
+    const f = focused();
+    return props.trades.filter((t) => (!f || f.test(t)) && (side() === 'all' || t.side === side()) && (!q || t.market.toUpperCase().includes(q) || t.strategy.toUpperCase().includes(q) || t.notes.toUpperCase().includes(q)));
   });
   const counts = createMemo(() => {
     const c: Record<View, number> = { all: 0, open: 0, win: 0, loss: 0, even: 0 };
@@ -715,6 +812,9 @@ function History(props: { trades: Trade[]; price: (market: string, v: number | n
       .map(([day, list]) => ({ day, trades: list.sort((a, b) => when(b) - when(a)), pnl: list.reduce((s, t) => s + (pnl(t) ?? 0), 0), r: list.reduce((s, t) => s + (rMultiple(t) ?? 0), 0) }));
   });
   const many = (n: number) => `${n} trade${n === 1 ? '' : 's'}`;
+  /** What is listed, and whether it is one pair's with something entered to draw. */
+  const listed = createMemo(() => [...live(), ...days().flatMap((d) => d.trades)]);
+  const drawable = createMemo(() => new Set(listed().map((t) => symbolOf(t.market))).size === 1 && tradePicture(listed(), Date.now()) !== null);
   return (
     <div class="jh">
       <div class="jh-bar">
@@ -737,6 +837,23 @@ function History(props: { trades: Trade[]; price: (market: string, v: number | n
             )}
           </For>
         </div>
+        <Show when={focused()}>
+          {(f) => (
+            <button class="jh-focus" aria-label={`Show every trade, not only ${f().label}`} data-tip={`Only ${f().by.toLowerCase()} ${f().label}: show every trade`} onClick={() => props.onUnfocus()}>
+              <span class="dim">{f().by}</span> {f().label}
+              <Icon name="close" size={11} />
+            </button>
+          )}
+        </Show>
+        <button
+          class="tb jh-chart"
+          disabled={!drawable()}
+          data-tip={drawable() ? 'Draw these trades on the chart, each where it was entered and closed' : 'Narrow the list to one pair to draw its trades on the chart'}
+          onClick={() => props.onChart(listed())}
+        >
+          <Icon name="long" size={12} />
+          <span>Show on chart</span>
+        </button>
         <label class="jh-search">
           <Icon name="search" size={12} />
           <input placeholder="Search market, strategy, notes" value={query()} onInput={(e) => setQuery(e.currentTarget.value)} />
@@ -905,6 +1022,7 @@ function SizeFields(props: {
 function Editor(props: {
   trade: Trade;
   price: (market: string, v: number | null) => string;
+  digits: (market: string, v: number) => number;
   onClose: () => void;
   onChange: (t: Trade) => void;
   onRemove: (id: number) => void;
@@ -922,19 +1040,23 @@ function Editor(props: {
   const [exit, setExit] = createSignal('');
   const [closedAt, setClosedAt] = createSignal('');
   // The form from the trade: when it opens, and again from what the server kept once saved.
-  // A price as typed, without the float's tail an average leaves: 80311.69999999998 is 80311.7.
-  const plain = (v: number) => String(Number(v.toPrecision(12)));
+  // A price to the market's decimals, as its chart quotes it: not the float's tail an average
+  // leaves (80311.69999999998), nor where a dragged anchor let go (0.0797612345).
+  const plain = (v: number) => String(Number(v.toFixed(props.digits(t().market, v))));
+  /** The prices as the form was filled with them: a field left as it is changes nothing. */
+  let base = { entry: '', stop: '', target: '', exit: '' };
   const fill = (x: Trade) => {
-    setEntry(plain(x.entry));
-    setStop(plain(x.stop));
-    setTarget(plain(x.target));
+    base = { entry: plain(x.entry), stop: plain(x.stop), target: plain(x.target), exit: x.exit === null ? '' : plain(x.exit) };
+    setEntry(base.entry);
+    setStop(base.stop);
+    setTarget(base.target);
     setLeverage(x.leverage > 0 ? x.leverage : 1);
     setMargin(marginFor(x.qty, x.entry, x.leverage > 0 ? x.leverage : 1));
     setFees(x.fees ? String(x.fees) : '');
     setStrategy(x.strategy);
     setNotes(x.notes);
     setMode(modeOf(x));
-    setExit(x.exit === null ? '' : plain(x.exit));
+    setExit(base.exit);
     setClosedAt(localInput(x.closedAt ?? Date.now()));
   };
   fill(t());
@@ -945,14 +1067,14 @@ function Editor(props: {
   const coins = () => coinsFor(margin(), Number(entry()), leverage());
   const dir = () => (t().side === 'long' ? 1 : -1);
   const legs = (): DrawnLeg[] => t().legs.map((l) => ({ kind: l.kind, price: l.price, percent: l.share * 100 }));
-  const moved = () => entry() !== plain(t().entry) || stop() !== plain(t().stop) || target() !== plain(t().target);
+  const moved = () => entry() !== base.entry || stop() !== base.stop || target() !== base.target;
   /** What the form comes to, before it is saved; null where only price can say. */
   const result = createMemo((): number | null => {
     const [x, m, feesNow] = [t(), mode(), Number(fees() || 0)];
     if (m === 'cancelled' || !(coins() > 0)) return null;
     if (m === 'auto') return isClosed(x) && !moved() && x.qty > 0 ? ((pnl(x)! + x.fees) * coins()) / x.qty - feesNow : null;
     if (m === 'closed' && !(Number(exit()) > 0)) return null;
-    return closedPnl(x, { entry: entry() === plain(x.entry) ? x.entry : Number(entry()), qty: coins(), exit: m === 'closed' ? Number(exit()) : null, fees: feesNow });
+    return closedPnl(x, { entry: entry() === base.entry ? x.entry : Number(entry()), qty: coins(), exit: m === 'closed' ? (exit() === base.exit && x.exit !== null ? x.exit : Number(exit())) : null, fees: feesNow });
   });
   const heroTone = () => {
     const r = result();
@@ -968,9 +1090,9 @@ function Editor(props: {
   const patch = (): TradePatch => {
     const x = t();
     const p: TradePatch = {};
-    if (entry() !== plain(x.entry)) p.entry = Number(entry());
-    if (stop() !== plain(x.stop)) p.stop = Number(stop());
-    if (target() !== plain(x.target)) p.target = Number(target());
+    if (entry() !== base.entry) p.entry = Number(entry());
+    if (stop() !== base.stop) p.stop = Number(stop());
+    if (target() !== base.target) p.target = Number(target());
     // A margin rounds to the cent as it shows; only a real change is a new size.
     if (coins() > 0 && Math.abs(coins() - x.qty) > x.qty * 1e-9) p.qty = coins();
     if (leverage() !== x.leverage) p.leverage = leverage();
@@ -983,7 +1105,7 @@ function Editor(props: {
     if (m === 'auto') {
       if (!x.auto) p.auto = true;
     } else if (m === 'closed') {
-      if (changed || exit() !== (x.exit === null ? '' : plain(x.exit))) Object.assign(p, { status: 'closed', exit: Number(exit()), closedAt: at });
+      if (changed || exit() !== base.exit) Object.assign(p, { status: 'closed', exit: exit() === base.exit && x.exit !== null ? x.exit : Number(exit()), closedAt: at });
     } else if (changed) Object.assign(p, { status: m, closedAt: at });
     return p;
   };
