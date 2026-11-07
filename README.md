@@ -330,6 +330,21 @@ of partitions.
 `deno task test` replays recorded exchange payloads through the stream hub, and
 `deno task size` checks the bundle budget after `deno task build`.
 
+The server's integration tests (`bins/server/tests/api.rs`) start the real binary
+and speak HTTP to it — drawings, layouts, the scoping between browsers, the rate
+limits and the relay's allow-list — so they need a database they may write to.
+`./scripts/test-api.sh` finds one: it reuses the cluster `tradoor-server` keeps —
+starting it if it is stopped — in a `tradoor_test` database of its own, so every
+run after the first skips the migrations; on a machine with no such cluster it
+makes a temporary one and removes it. Anything after its name goes to cargo, so
+`./scripts/test-api.sh relay` runs just those tests. It needs `initdb` and `pg_ctl`
+on `PATH`, or `PG_BIN` naming the directory that holds them, and reads
+`TRADOOR_PGDATA` and `TRADOOR_PGPORT` when the cluster lives somewhere else.
+
+To run them against a database of your own, set `TEST_DATABASE_URL` — the script
+then uses it as it is, and plain `cargo test` does too; with it unset under
+`cargo test`, these tests are skipped.
+
 **Keyboard**
 
 `a–z` search a symbol · `← →` timeframe · `/` or `Ctrl K` commands · `?` help ·

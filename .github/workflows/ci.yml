@@ -23,6 +23,24 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    # The server's HTTP integration tests migrate and fill a database of their
+    # own, so CI gives them one; nothing else in the run touches it.
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: tradoor
+          POSTGRES_PASSWORD: tradoor
+          POSTGRES_DB: tradoor_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tradoor -d tradoor_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgres://tradoor:tradoor@127.0.0.1:5432/tradoor_test
     steps:
       - uses: actions/checkout@v7
 

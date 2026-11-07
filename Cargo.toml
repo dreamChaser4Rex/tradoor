@@ -8,19 +8,18 @@ edition = "2024"
 rust-version = "1.95"
 license = "AGPL-3.0-only"
 
+[profile.release]
+lto = true
+codegen-units = 1
+
+[profile.wasm]
+inherits = "release"
+opt-level = "z"
+panic = "abort"
+
 [workspace.dependencies]
 tradoor-core = { path = "crates/core" }
 tradoor-codec = { path = "crates/codec" }
 tradoor-venues = { path = "crates/venues" }
 tradoor-render = { path = "crates/render" }
-
-[profile.release]
-lto = true
-codegen-units = 1
-
-# The browser engine is built with this profile: size first, because the WASM
-# download is part of how fast the terminal opens.
-[profile.wasm]
-inherits = "release"
-opt-level = "z"
-panic = "abort"
+tradoor-store = { path = "crates/store" }

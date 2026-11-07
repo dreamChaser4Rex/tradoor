@@ -335,11 +335,22 @@ impl Catalog {
 
 /// The compact catalogue: each venue's markets as rows of `COLUMNS`, the
 /// turnover to four figures and the change to two decimals, as shown.
+/// Round a 24h quote volume to four significant figures, as the catalogue
+/// wire shows it. A market that traded nothing must not take the whole
+/// catalogue down: `log10(0.0)` is -inf, so `10f64.powi(3 - (i32::MIN))` would
+/// overflow — the zero case is handled exactly.
+fn round_volume(v: f64) -> f64 {
+    if !v.is_finite() {
+        return v;
+    }
+    if v == 0.0 {
+        return 0.0;
+    }
+    let scale = 10f64.powi(3 - v.abs().log10().floor() as i32);
+    (v * scale).round() / scale
+}
+
 fn wire_of(updated_at: i64, venues: &[VenueStatus], by_venue: &[(Venue, Vec<Product>)]) -> serde_json::Value {
-    let figures = |v: f64| {
-        let scale = 10f64.powi(3 - v.abs().log10().floor() as i32);
-        if v == 0.0 || !v.is_finite() { v } else { (v * scale).round() / scale }
-    };
     let markets: serde_json::Map<String, serde_json::Value> = by_venue
         .iter()
         .map(|(venue, products)| {
@@ -351,7 +362,7 @@ fn wire_of(updated_at: i64, venues: &[VenueStatus], by_venue: &[(Venue, Vec<Prod
                         json!(p.base),
                         json!(p.quote),
                         json!(p.price_decimals),
-                        json!(p.quote_volume_24h.map(figures)),
+                        json!(p.quote_volume_24h.map(round_volume)),
                         json!(p.last_price),
                         json!(p.change_pct.map(|c| (c * 100.0).round() / 100.0)),
                         json!(p.native),
@@ -378,11 +389,19 @@ fn compress(plain: &[u8]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn a_coin_is_its_symbol_less_the_quote() {
-        assert_eq!(super::coin_of("BTCUSDT"), "BTC");
-        assert_eq!(super::coin_of("1000PEPEUSDC"), "1000PEPE");
-        assert_eq!(super::coin_of("ETHUSD"), "ETH");
-        assert_eq!(super::coin_of("USDT"), "USDT", "a bare quote stays itself");
-    }
+        assert_eq!(coin_of("BTCUSDT"), "BTC");
+        assert_eq!(coin_of("1000PEPEUSDC"), "1000PEPE");
+        assert_eq!(coin_of("ETHUSD"), "ETH");
+        assert_eq!(coin_of("USDT"), "USDT", "a bare quote stays itself");
+    }        #[test]
+        fn rounds_a_market_with_zero_volume_to_zero() {
+            // A market that traded nothing must not take the whole catalogue down with it.
+            // Before the fix, `10f64.powi(3 - (i32::MIN))` overflowed when `figures`
+            // reached for `v.abs().log10().floor()` on `v == 0.0`.
+            assert_eq!(round_volume(0.0), 0.0);
+        }
 }
